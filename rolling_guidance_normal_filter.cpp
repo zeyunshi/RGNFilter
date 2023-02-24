@@ -65,39 +65,69 @@
         const Eigen::VectorXd& areas, Eigen::MatrixXd& result_nls,
         const double sigma_r, const double sigma_s, const int iter_num) {
         const double avg_edge_len = computeAverageEdgeLength(pts, tris);
+        const double EPSILON = 1e-20;
         
+        Eigen::MatrixXd pos(6, tris.cols());
+        pos.block(0, 0, 3, tris.cols()) = centers / (sigma_s * avg_edge_len);
 
-        const int pos_dim = 6, val_dim = 3, data_num = static_cast<int>(tris.cols());
-        PermutohedralLattice lattice(pos_dim, val_dim, data_num);
+        Eigen::MatrixXd vals = nls;
+        for (int i = 0; i < tris.cols(); ++i)
+            vals.col(i) *= areas[i];
+        
+        for (int i = 0; i < iter_num; ++i) {
+            pos.block(3, 0, 3, pos.cols()) = result_nls / sigma_r;
 
-        std::vector<float> pos(6), val(3);
-        const double pos_scale = 1.0/(sigma_s * avg_edge_len);
-        const double nls_scale = 1.0/sigma_r;
-        for (int i = 0; i < tris.cols(); ++i) {
-            for (int t = 0; t < 3; ++t) {
-                pos[t] = static_cast<float>(centers(t, i) * pos_scale);
-                pos[3 + t] = static_cast<float>(result_nls(t, i) * nls_scale);
-                val[t] = static_cast<float>(nls(t, i));
+            PermutohedralLattice lattice(pos.rows(), vals.rows(), pos.cols());
+            std::vector<float> p(6), v(3);
+            for (int i = 0; i < tris.cols(); ++i) {
+                for (int t = 0; t < 3; ++t) {
+                    p[t] = static_cast<float>(pos(t, i));
+                    v[t] = static_cast<float>(vals(t, i));
+                }
+                for (int t = 3; t < 6; ++t)
+                    p[t] = static_cast<float>(pos(t, i));
+                lattice.splat(&p[0], &v[0]);
             }
-            lattice.splat(&pos[0], &val[0]);
-        }
 
-        lattice.blur();
+            lattice.blur();
 
-        lattice.beginSlice();
-        for (int i = 0; i < tris.cols(); ++i) {
-            lattice.slice(&val[0]);
-            for (int t = 0; t < 3; ++t)
-                result_nls(t, i) = val[t];
+            lattice.beginSlice();
+            for (int i = 0; i < tris.cols(); ++i) {
+                lattice.slice(&v[0]);
+                for (int t = 0; t < 3; ++t)
+                    result_nls(t, i) = v[t];
+            }
+
+            for (int j = 0; j < result_nls.cols(); j++)
+            {
+                double d = result_nls.col(j).norm();
+                if (d < EPSILON) 
+                    result_nls.col(j) = nls.col(j);
+                else 
+                    result_nls.col(j) /= d;
+            }
         }
 
         return 0;
     }
 
     void computeRotation(const Eigen::Vector3d& vec_a, const Eigen::Vector3d& vec_b, Eigen::Matrix3d& rot) {
+        double tmp = vec_a.norm() * vec_b.norm();
+        if (tmp < 1e-20) {
+            rot.setIdentity();
+            return;
+        }
         Eigen::Vector3d axis = vec_a.cross(vec_b);
-        axis.normalize();
-        const double cos_alpha = vec_a.dot(vec_b) / (vec_a.norm() * vec_b.norm());
+        const double len = axis.norm();
+        if (len < 1e-20)
+            axis = Eigen::Vector3d(0, 0, 1);
+        else
+            axis /= len;
+        double cos_alpha = vec_a.dot(vec_b) / tmp;
+        if (cos_alpha < -1) 
+            cos_alpha = -1;
+        if (cos_alpha > 1) 
+            cos_alpha = 1;
         const double alpha = acos(cos_alpha);
         rot = Eigen::AngleAxisd(acos(cos_alpha), axis).toRotationMatrix();
     }
@@ -374,6 +404,16 @@
         L.setFromTriplets(triple.begin(), triple.end());
     }
 
+    void generateIdentityMatrix(const int dim, Eigen::SparseMatrix<double>& I) {
+        I.resize(dim, dim);
+        std::vector<Eigen::Triplet<double>> triple;
+        triple.reserve(dim);
+        for (int i = 0; i < dim; i++)
+            triple.emplace_back(i, i, 1);
+        I.setFromTriplets(triple.begin(), triple.end());
+        I.makeCompressed();
+    }
+
     void computeNormalConstraint(const Eigen::MatrixXd& pts, const Eigen::MatrixXi& tris, const Eigen::MatrixXd &nls,
         const int dim, Eigen::SparseMatrix<double>& C, Eigen::VectorXd& b) {
         std::vector<Eigen::Triplet<double>> triple;
@@ -390,7 +430,7 @@
         C.setFromTriplets(triple.begin(), triple.end());
     }
 
-    int vertexUpdating(const Eigen::MatrixXd& pts, const Eigen::MatrixXi& tris, 
+    int vertexUpdatingLaplace(const Eigen::MatrixXd& pts, const Eigen::MatrixXi& tris, 
         const Eigen::MatrixXd &centers, const Eigen::MatrixXd& origin_nls,
         const Eigen::MatrixXd& filtered_nls, Eigen::MatrixXd& result_pts) {
         // generate poisson structure 
@@ -437,6 +477,107 @@
         return 0;
     }
 
+    void computeFaceGradient(const Eigen::Vector3d &v0, const Eigen::Vector3d &v1, const Eigen::VectorXd &v2, Eigen::Matrix3d& grad) {
+        Eigen::Vector3d e0 = v1 - v0; 
+        Eigen::Vector3d e1 = v2 - v1;
+        Eigen::Vector3d e2 = v0 - v2;
+
+        Eigen::Vector3d n = e0.cross(e1);
+        double len2 = n.squaredNorm();
+        if (len2 < 1e-20) // for degenerated case
+        {
+            for (int i = 0; i < 3; i++)
+                grad.col(i) = Eigen::Vector3d::Zero();
+        }
+        else
+        {
+            grad.col(0) = n.cross(e1) / len2;
+            grad.col(1) = n.cross(e2) / len2;
+            grad.col(2) = n.cross(e0) / len2;
+        }
+    }
+
+    void computeGradientMatrix(const Eigen::MatrixXd& pts, const Eigen::MatrixXi& tris, Eigen::SparseMatrix<double>& G) {
+        std::vector<Eigen::Triplet<double>> triple;
+        triple.reserve(9 * tris.cols());
+        Eigen::Matrix3d grad;
+        for (int i = 0; i < tris.cols(); ++i) {
+            computeFaceGradient(pts.col(tris(0, i)), pts.col(tris(1, i)), pts.col(tris(2, i)), grad);
+            for (int k = 0; k < 3; ++k) {
+                for (int j = 0; j < 3; ++j) {
+                    triple.emplace_back(3 * i + j, tris(k, i), grad(j, k));
+                }
+            }
+        }
+
+        G.resize(3 * tris.cols(), pts.cols());
+        G.reserve(Eigen::VectorXi::Constant(3 * tris.cols(), 3));
+        G.setFromTriplets(triple.begin(), triple.end());
+    }
+
+    void computeMassMatrix(const Eigen::VectorXd& areas, Eigen::SparseMatrix<double>& M) {
+        std::vector<Eigen::Triplet<double>> triple;
+        triple.reserve(3 * areas.size());
+        for (int i = 0; i < areas.size(); ++i) {
+            for (int t = 0; t < 3; ++t)
+                triple.emplace_back(3*i+t, 3*i+t, areas[i]);
+        }
+        M.resize(3 * areas.size(), 3 * areas.size());
+        M.setFromTriplets(triple.begin(), triple.end());
+        const double avg_area = areas.sum() / areas.size();
+        M /= avg_area;
+    }
+
+    void computeDivMatrix(const Eigen::MatrixXd& pts, const Eigen::MatrixXi& tris,
+        const Eigen::MatrixXd& origin_nls, const Eigen::MatrixXd& filtered_nls, Eigen::MatrixXd& Dv) {
+        Dv.resize(3 * tris.cols(), 3);
+
+        Eigen::Matrix3d rot, tri_pts, rot_pts;
+        Eigen::Matrix3d grad;
+        rot.setIdentity();
+        for (int f = 0; f < tris.cols(); ++f) {
+            computeRotation(origin_nls.col(f), filtered_nls.col(f), rot);
+            for (int t = 0; t < 3; ++t) {
+                tri_pts.col(t) = pts.col(tris(t, f));
+            }
+            rot_pts = rot * tri_pts;
+            computeFaceGradient(rot_pts.col(0), rot_pts.col(1), rot_pts.col(2), grad);
+            Dv.block(3 * f, 0, 3, 3) = grad * rot_pts.transpose();
+        }
+    }
+
+    int vertexUpdatingGradient(const Eigen::MatrixXd& pts, const Eigen::MatrixXi& tris,
+        const Eigen::VectorXd &areas, const Eigen::MatrixXd& origin_nls,
+        const Eigen::MatrixXd& filtered_nls, Eigen::MatrixXd& result_pts) {
+        Eigen::SparseMatrix<double> G;
+        computeGradientMatrix(pts, tris, G);
+        Eigen::SparseMatrix<double> Gt = G.transpose();
+        
+        Eigen::SparseMatrix<double> M;
+        computeMassMatrix(areas, M);
+
+        Eigen::SparseMatrix<double> LV = Gt * M * G;
+
+
+        Eigen::SparseMatrix<double> I;
+        generateIdentityMatrix(pts.cols(), I);
+        Eigen::SimplicialLDLT<Eigen::SparseMatrix<double> > solver;
+        double wl = 3000;
+        Eigen::SparseMatrix<double> A = wl * LV + I;
+        solver.analyzePattern(A);
+        solver.factorize(A);
+
+        Eigen::MatrixXd Dv;
+        computeDivMatrix(pts, tris, origin_nls, filtered_nls, Dv);
+        Eigen::MatrixXd deltaV = Gt * M * Dv;
+
+        Eigen::MatrixXd b = pts.transpose() + wl * deltaV;
+        Eigen::MatrixXd x = solver.solve(b);
+        
+        result_pts = x.transpose();
+        return 0;
+    }
+
     int tri2vtk_with_normal(const char *file_name, 
         const Eigen::MatrixXd& pts, const Eigen::MatrixXi& tris, const Eigen::MatrixXd& nls) {
         std::ofstream ofs(file_name);
@@ -461,25 +602,23 @@
         Eigen::MatrixXd nls;
         Eigen::VectorXd areas;
         computeFaceNormals(pts, tris, nls, areas);
-        tri2vtk_with_normal("origin_normal.vtk", pts, tris, nls);
+        //tri2vtk_with_normal("origin_normal.vtk", pts, tris, nls);
 
         Eigen::MatrixXd centers;
         computeFaceCenters(pts, tris, centers);
 
         Eigen::MatrixXd  filtered_nls(3, tris.cols());
         filtered_nls.setZero();
-        const double sigma_r = 0.3, sigma_s = 5.0;
+        const double sigma_r = 0.2, sigma_s = 5.0;
         const int iter_num = 5;
-        for (int i = 0; i < 5; ++i) {
-            rollingGuidanceNormalFiltering(pts, tris, centers, nls, areas, filtered_nls, sigma_r, sigma_s, iter_num);
-        }
+        rollingGuidanceNormalFiltering(pts, tris, centers, nls, areas, filtered_nls, sigma_r, sigma_s, iter_num);
         
-        tri2vtk_with_normal("filtered_normal.vtk", pts, tris, filtered_nls);
+        //tri2vtk_with_normal("filtered_normal.vtk", pts, tris, filtered_nls);
 
-        rotationDisconnected(pts, tris, centers, nls, filtered_nls);
+        //rotationDisconnected(pts, tris, centers, nls, filtered_nls);
 
-        int ret = vertexUpdating(pts, tris, centers, nls, filtered_nls, result_pts);
-        tri2vtk_with_normal("rgdsmoothing.vtk", result_pts, tris, filtered_nls);
+        int ret = vertexUpdatingGradient(pts, tris, areas, nls, filtered_nls, result_pts);
+        //tri2vtk_with_normal("rgdsmoothing.vtk", result_pts, tris, filtered_nls);
         return ret;
     }
 
@@ -501,8 +640,12 @@ int main(int argc, char **argv) {
     }
     
     Eigen::MatrixXd result_pts;
+    clock_t start, end;
+    start = clock();
     rgdSmoothing(pts, tris, result_pts);
-    
+    end = clock();
+    std::cout << "Filter time : " << (double)(end - start) / 1000.0 << " sec" << std::endl;
+
     std::ofstream ofs(argv[2]);
     if (ofs.fail()) {
         std::cerr << "#[error] can't open : " << argv[2] << std::endl;
